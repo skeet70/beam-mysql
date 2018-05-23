@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
 
 module Database.Beam.MySQL.Connection
@@ -19,7 +20,12 @@ module Database.Beam.MySQL.Connection
 import           Database.Beam.MySQL.Syntax
 import           Database.Beam.MySQL.FromField
 
+import           Database.Beam.Query (QExpr, QValueContext, SqlInsert(..), SqlInsertValues(..), insert, select, as_)
+import           Database.Beam.Schema.Tables ( DatabaseEntity(..)
+                                             , DatabaseEntityDescriptor(..)
+                                             , TableEntity)
 import           Database.Beam.Backend.SQL
+import qualified Database.Beam.Backend.SQL.BeamExtensions as Beam
 import           Database.Beam.Backend.URI
 
 import           Database.MySQL.Base as MySQL
@@ -28,16 +34,19 @@ import qualified Database.MySQL.Base.Types as MySQL
 import           Control.Exception
 import           Control.Monad.Except
 import           Control.Monad.Free.Church
+import           Control.Monad.Identity (Identity)
 import           Control.Monad.Reader
 
 import           Data.ByteString.Builder
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy as BL
 import           Data.Int
-import           Data.List
+import           Data.List hiding (insert)
 import           Data.Maybe
 import           Data.Ratio
 import           Data.Scientific
+import           Data.Semigroup ((<>))
+import           Data.String (fromString)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Lazy as TL
@@ -45,6 +54,14 @@ import           Data.Time (LocalTime)
 import           Data.Word
 
 import           Network.URI
+
+#ifdef UNIX
+import           System.Posix.Process (getProcessID)
+#elif defined(WINDOWS)
+import           System.Win32.Process (getCurrentProcessId)
+#else
+#error Need either POSIX or Win32 API for MonadBeamInsertReturning
+#endif
 
 import           Text.Read hiding (step)
 
@@ -131,6 +148,75 @@ instance MonadBeam MysqlCommandSyntax MySQL Connection MySQLM where
 
             runReaderT doConsume (dbg, conn)
 
+instance Beam.MonadBeamInsertReturning MysqlCommandSyntax MySQL Connection MySQLM where
+    runInsertReturningList tbl values = runInsertReturningList $ insertReturning tbl values
+
+-- * emulated INSERT returning support
+
+-- | Represents an @INSERT@ statement, from which we can retrieve inserted rows.
+-- Beam also offers a backend-agnostic way of using this functionality in the
+-- 'MonadBeamInsertReturning' extension. This functionality is emulated in
+-- MySQL using a temporary table and a trigger.
+data MysqlInsertReturning (table :: (* -> *) -> *) = MysqlInsertReturning T.Text MysqlInsertSyntax | MysqlInsertReturningNoRows
+
+-- | Build a 'MysqlInsertReturning' representing inserting the given values
+-- into the given table.
+insertReturning :: DatabaseEntity be db (TableEntity table)
+                -> SqlInsertValues MysqlInsertValuesSyntax (table (QExpr MysqlExpressionSyntax s))
+                -> MysqlInsertReturning table
+insertReturning tbl@(DatabaseEntity (DatabaseTable tblNm _)) vs =
+    case insert tbl vs of
+        SqlInsert s -> MysqlInsertReturning tblNm s
+        SqlInsertNoRows -> MysqlInsertReturningNoRows
+
+-- | Runs a 'MysqlInsertReturning' statement and returns a result for each
+-- inserted row.
+runInsertReturningList :: FromBackendRow MySQL (table Identity)
+                       => MysqlInsertReturning table
+                       -> MySQLM [ table Identity ]
+runInsertReturningList MysqlInsertReturningNoRows = pure []
+runInsertReturningList (MysqlInsertReturning name (MysqlInsertSyntax insertQ)) =
+    do 
+        (logger, conn) <- MySQLM ask
+        MySQLM . liftIO $ do
+            cmdBuilder <- insertQ (\_ b _ -> pure b) (MySQL.escape conn) mempty conn
+            let cmdStr = BL.toStrict (toLazyByteString cmdBuilder)
+#ifdef UNIX
+            processId <- fromString . show <$> getProcessID
+#elif defined(WINDOWS)
+            processId <- fromString . show <$> getCurrentProcessId
+#else
+#error Need either POSIX or Win32 API for MonadBeamInsertReturning
+#endif
+            let startSavepoint =
+                    MySQL.query conn ("SAVEPOINT insert_savepoint_" <> processId)
+                rollbackToSavepoint =
+                    MySQL.query conn ("ROLLBACK TRANSACTION TO SAVEPOINT insert_savepoint_" <> processId)
+                releaseSavepoint =
+                    MySQL.query conn ("RELEASE SAVEPOINT insert_savepoint_" <> processId)
+
+                createInsertedValuesTable =
+                    MySQL.query conn ("CREATE TEMPORARY TABLE inserted_values_" <> processId <> " AS SELECT * FROM \"" <> TE.encodeUtf8 name <> "\" LIMIT 0")
+                dropInsertedValuesTable =
+                    MySQL.query conn ("DROP TABLE inserted_values_" <> processId)
+
+                createInsertTrigger =
+                    MySQL.query conn ("CREATE TRIGGER insert_trigger_" <> processId <> " AFTER INSERT ON \"" <> TE.encodeUtf8 name <> "\" BEGIN " <>
+                                        "INSERT INTO inserted_values_" <> processId <> " SELECT * FROM \"" <> TE.encodeUtf8 name <> "\" WHERE ROWID=LAST_INSERT_ID(); END" )
+                dropInsertTrigger =
+                    MySQL.query conn ("DROP TRIGGER insert_trigger_" <> processId)
+
+
+            mask $ \restore -> do
+                startSavepoint
+                flip onException rollbackToSavepoint . restore $ do
+                    x <- bracket_ createInsertedValuesTable dropInsertedValuesTable $
+                        bracket_ createInsertTrigger dropInsertTrigger $ do
+                            logger "help me"
+                            --fromBackendRow <$> MySQL.query conn ("SELECT * FROM inserted_values_" <> processId)
+                    releaseSavepoint
+                    return x
+                
 withMySQL :: (String -> IO ()) -> Connection
           -> MySQLM a -> IO a
 withMySQL dbg conn (MySQLM a) =

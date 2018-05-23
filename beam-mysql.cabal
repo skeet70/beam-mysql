@@ -41,6 +41,12 @@ library
   ghc-options:        -Wall
   if flag(werror)
     ghc-options:       -Werror
+  if os(windows)
+    cpp-options:      -DWINDOWS
+    build-depends:    Win32         >=2.4 && <2.8
+  if os(freebsd) || os(netbsd) || os(darwin) || os(linux) || os(solaris)
+    cpp-options:      -DUNIX
+    build-depends: unix >=2.0 && <2.8
 
 flag werror
   description: Enable -Werror during development
